@@ -4,7 +4,7 @@ import session from "express-session";
 import pool from "./db/pool.js";
 import { google } from "googleapis";
 import { processSession } from "./cron-worker.js"; // Import from cron worker
-
+import "./cron-worker.js"; // This will start the cron jobs
 const app = express();
 const PORT = Number(process.env.PORT || 5000);
 

@@ -10,94 +10,6 @@ async function getUserById(userId) {
   return rows[0] || null;
 }
 
-// async function refreshAccessToken(user) {
-//   console.log(`Attempting to refresh token for user: ${user.user_id}`);
-  
-//   const payload = new URLSearchParams({
-//     client_id: process.env.GOOGLE_CLIENT_ID,
-//     client_secret: process.env.GOOGLE_CLIENT_SECRET,
-//     refresh_token: user.refresh_token,
-//     grant_type: "refresh_token"
-//   });
-
-//   const resp = await fetch("https://oauth2.googleapis.com/token", {
-//     method: "POST",
-//     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-//     body: payload.toString()
-//   });
-
-//   if (!resp.ok) {
-//     const errorText = await resp.text();
-//     console.error(`Token refresh failed for user ${user.user_id}:`, errorText);
-    
-//     if (resp.status === 400 && errorText.includes('invalid_grant')) {
-//       // Mark tokens as invalid so user needs to re-authenticate
-//       console.log(`Clearing invalid tokens for user ${user.user_id}`);
-//       await pool.query(
-//         "UPDATE users SET access_token = '', refresh_token = '', token_expiry = NULL WHERE user_id = ?",
-//         [user.user_id]
-//       );
-//       throw new Error(`Refresh token invalid for user ${user.user_id}. User needs to re-authenticate.`);
-//     }
-//     throw new Error(`Token refresh failed: ${resp.status} ${errorText}`);
-//   }
-
-//   const json = await resp.json();
-//   console.log('this is from refreshAccesstoken method',json)
-//   const newToken = json.access_token;
-//   const newExpiry = Date.now() + ((json.expires_in || 3600) * 1000);
-
-//   // Update database with new token - FIXED VERSION
-//   console.log(`Updating tokens for user ${user.user_id}: expires at ${new Date(newExpiry).toISOString()}`);
-  
-//   const [result] = await pool.query(
-//     "UPDATE users SET access_token = ?, token_expiry = FROM_UNIXTIME(?) WHERE user_id = ?",
-//     [newToken, Math.floor(newExpiry / 1000), user.user_id]
-//   );
-
-//   console.log(`Token update result: ${result.affectedRows} rows affected for user ${user.user_id}`);
-
-//   if (result.affectedRows === 0) {
-//     throw new Error(`Failed to update token for user ${user.user_id} - user not found in database`);
-//   }
-
-//   console.log(`Successfully refreshed and updated token for user ${user.user_id}`);
-//   return newToken;
-// }
-
-// Replace the getValidAccessToken function in cron-worker.js
-// async function getValidAccessToken(userId) {
-//   const user = await getUserById(userId);
-//   if (!user) throw new Error("User not found");
-
-//   if (!user.refresh_token) {
-//     throw new Error(`No refresh token for user ${userId}. Re-authentication required.`);
-//   }
-
-//   const now = Date.now();
-//   const expiry = user.token_expiry ? new Date(user.token_expiry).getTime() : 0;
-  
-//   // Always refresh if token expires within 10 minutes (safety buffer) or already expired
-//   if (now >= expiry - 10 * 60 * 1000 || expiry === 0) {
-//     console.log(`Refreshing token for user ${userId} (expires: ${user.token_expiry || 'unknown'})`);
-    
-//     try {
-//       return await refreshAccessToken(user);
-//     } catch (error) {
-//       if (error.message.includes('re-authenticate')) {
-//         // Mark user tokens as invalid
-//         await pool.query(
-//           "UPDATE users SET access_token = '', refresh_token = '', token_expiry = NULL WHERE user_id = ?",
-//           [userId]
-//         );
-//         throw new Error(`Refresh token invalid for user ${userId}. User needs to re-authenticate.`);
-//       }
-//       throw error;
-//     }
-//   }
-
-//   return user.access_token;
-// }// cron-worker.js (replace your existing refreshAccessToken)
 
 async function getValidAccessToken(userId) {
   const user = await getUserById(userId);
@@ -314,15 +226,7 @@ async function processSession(session, attemptNumber) {
   } catch (error) {
     console.error(`✗ Session ${session.id} failed:`, error.message);
 
-    // Handle authentication errors
-    // if (error.message.includes('re-authenticate')) {
-    //   await pool.query(
-    //     "UPDATE sessions SET fetch_status = 'failed', status = 'failed' WHERE id = ?",
-    //     [session.id]
-    //   );
-    //   await logAttempt(session.id, session.user_id, attemptNumber, "auth_failed", error.message);
-    //   return { success: false, reason: 'auth_required' };
-    // }
+
 if (error.message && (error.message.includes("401") || error.message.includes("invalid_token") || error.message.includes("403"))) {
   await pool.query("UPDATE sessions SET fetch_status = 'failed', status = 'failed' WHERE id = ?", [session.id]);
   await logAttempt(session.id, session.user_id, attemptNumber, "auth_failed", error.message);
@@ -342,13 +246,7 @@ if (error.message && (error.message.includes("401") || error.message.includes("i
   }
 }
 
-// async function getAttemptCount(sessionId) {
-//   const [[row]] = await pool.query(
-//     "SELECT COUNT(*) AS count FROM fetch_logs WHERE session_id = ? AND attempt_number BETWEEN 1 AND 5",
-//     [sessionId]
-//   );
-//   return Number(row.count || 0);
-// }
+
 
 
 async function getAttemptCount(sessionId) {
