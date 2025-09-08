@@ -1,0 +1,605 @@
+import "dotenv/config";
+import express from "express";
+import session from "express-session";
+import nodeCron from "node-cron";
+import pool from "./db/pool.js";
+import { google } from "googleapis";
+
+const app = express();
+const PORT = Number(process.env.PORT || 5000);
+
+// ---------- Middleware ----------
+app.use(express.json());
+
+// Simple memory session for dev. In prod, use Redis store.
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || "change-me",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      secure: false,         // true behind HTTPS in prod
+      sameSite: "lax",
+      maxAge: 24 * 60 * 60 * 1000
+    }
+  })
+);
+
+// ---------- Config ----------
+const OAUTH_SCOPES = [
+  "https://www.googleapis.com/auth/fitness.heart_rate.read",
+  "https://www.googleapis.com/auth/userinfo.profile",
+  "https://www.googleapis.com/auth/userinfo.email",
+  "openid"
+];
+
+const SESSION_DEFAULT_MINUTES = Number(process.env.SESSION_DEFAULT_MINUTES || 20);
+const FETCH_BUFFER_MINUTES = Number(process.env.FETCH_BUFFER_MINUTES || 15);
+
+function createOAuthClient() {
+  return new google.auth.OAuth2(
+   "45946153604-kkpr1i9t3pvkinhf624h0d4bhbui7u72.apps.googleusercontent.com",
+    "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",
+   "http://localhost:5000/auth/google/callback"
+  );
+}
+
+// ---------- Helpers ----------
+
+
+function nsRangeFromMs(msStart, msEnd) {
+  // Use BigInt to avoid precision loss
+  const startNs = (BigInt(msStart) * 1000000n).toString();
+  const endNs = (BigInt(msEnd) * 1000000n).toString();
+  return `${startNs}-${endNs}`;
+}
+
+async function getUserById(userId) {
+  const [rows] = await pool.query("SELECT * FROM users WHERE user_id = ?", [userId]);
+  return rows[0] || null;
+}
+
+async function updateUserTokens(userId, accessToken, expiry, refreshTokenMaybe) {
+  const params = [accessToken, new Date(expiry), userId];
+  let sql =
+    "UPDATE users SET access_token = ?, token_expiry = ? WHERE user_id = ?";
+
+  if (refreshTokenMaybe) {
+    sql =
+      "UPDATE users SET access_token = ?, token_expiry = ?, refresh_token = ? WHERE user_id = ?";
+    params.splice(2, 0, refreshTokenMaybe); // insert refresh token as 3rd arg
+  }
+  await pool.query(sql, params);
+}
+
+async function ensureValidAccessToken(user) {
+  const now = Date.now();
+  const expiry = new Date(user.token_expiry).getTime();
+  if (now < expiry - 60 * 1000) {
+    return user.access_token; // still valid (60s skew)
+  }
+
+  // Refresh manually with token endpoint (reliable and simple)
+  const payload = new URLSearchParams({
+    client_id: "45946153604-kkpr1i9t3pvkinhf624h0d4bhbui7u72.apps.googleusercontent.com",
+    client_secret: "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",
+    refresh_token: user.refresh_token,
+    grant_type: "refresh_token"
+  });
+
+  const resp = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: payload.toString()
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`Token refresh failed: ${resp.status} ${txt}`);
+  }
+
+  const json = await resp.json();
+  // expires_in (seconds)
+  const newAccess = json.access_token;
+  const expiresInMs = (json.expires_in || 3600) * 1000;
+  const newExpiry = Date.now() + expiresInMs;
+
+  await updateUserTokens(user.user_id, newAccess, newExpiry);
+  return newAccess;
+}
+
+async function insertHeartRatePoints({ userId, sessionId, startMs, endMs, points }) {
+  // We only insert points INSIDE [startMs, endMs]; but we may fetch with buffer
+  if (!points || !points.length) return 0;
+  let inserted = 0;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    for (const p of points) {
+      const tsMs = Number(p.startTimeNanos) / 1e6; // ns -> ms
+      if (Number.isNaN(tsMs)) continue;
+      if (tsMs < startMs || tsMs > endMs) continue; // enforce window
+
+      const bpm = p.value?.[0]?.fpVal;
+      if (typeof bpm !== "number") continue;
+
+      await conn.query(
+        "INSERT IGNORE INTO heart_rate (user_id, session_id, bpm, timestamp, source) VALUES (?, ?, ?, FROM_UNIXTIME(?/1000), ?)",
+        [userId, sessionId, Math.round(bpm), tsMs, p.originDataSourceId || "google_fit"]
+      );
+      inserted++;
+    }
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+  return inserted;
+}
+
+async function upsertMeanResult(userId, sessionId) {
+  const [[row]] = await pool.query(
+    "SELECT AVG(bpm) AS mean_bpm FROM heart_rate WHERE user_id = ? AND session_id = ?",
+    [userId, sessionId]
+  );
+  const mean = row?.mean_bpm;
+  if (mean == null) return 0;
+
+  await pool.query(
+    `INSERT INTO results (user_id, session_id, mean_bpm)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE mean_bpm = VALUES(mean_bpm), updated_at = CURRENT_TIMESTAMP`,
+    [userId, sessionId, mean]
+  );
+  return Number(mean);
+}
+
+async function logFetch({ sessionId, userId, attemptNumber, status, message }) {
+  await pool.query(
+    "INSERT INTO fetch_logs (session_id, user_id, attempt_number, status, message) VALUES (?, ?, ?, ?, ?)",
+    [sessionId, userId, attemptNumber, status, message?.slice(0, 5000) || null]
+  );
+}
+
+function msAddMinutes(ms, mins) {
+  return ms + mins * 60 * 1000;
+}
+
+
+async function fetchGoogleFitDataset({ accessToken, dataSourceId, startMs, endMs }) {
+  const datasetId = nsRangeFromMs(startMs, endMs);
+  const url = `https://www.googleapis.com/fitness/v1/users/me/dataSources/${encodeURIComponent(
+    dataSourceId
+  )}/datasets/${datasetId}`;
+
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Dataset API ${resp.status}: ${text}`);
+  }
+
+  const json = await resp.json();
+  return json.point || [];
+}
+
+async function runFetchForSession({ session, attemptNumber, manual = false }) {
+  const user = await getUserById(session.user_id);
+  if (!user) throw new Error("User not found for session");
+
+  const accessToken = await ensureValidAccessToken(user);
+
+  const bufferMs = FETCH_BUFFER_MINUTES * 60 * 1000;
+  const startMs = new Date(session.start_time).getTime();
+  const endMs = new Date(session.end_time).getTime();
+  const adjustedStart = startMs - bufferMs;
+  const adjustedEnd = endMs + bufferMs;
+
+  const dataSourceId = "derived:com.google.heart_rate.bpm:com.google.android.gms:merge_heart_rate_bpm";
+
+  try {
+    const points = await fetchGoogleFitDataset({
+      accessToken,
+      dataSourceId,
+      startMs: adjustedStart,
+      endMs: adjustedEnd
+    });
+
+    const inserted = await insertHeartRatePoints({
+      userId: session.user_id,
+      sessionId: session.id,
+      startMs,
+      endMs,
+      points
+    });
+
+    let status = "no_data";
+    let msg = `Inserted ${inserted} points`;
+
+    if (inserted > 0) {
+      const mean = await upsertMeanResult(session.user_id, session.id);
+      await pool.query(
+        "UPDATE sessions SET fetch_status = 'fetched', status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [session.id]
+      );
+      status = "success";
+      msg += `; mean_bpm=${mean}`;
+    } else {
+      // No points — decide whether to retry later or fail if final attempt
+      const isFinal = !manual && attemptNumber >= 5;
+      await pool.query(
+        "UPDATE sessions SET fetch_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [isFinal ? "failed" : "retry", session.id]
+      );
+      if (isFinal) {
+        await pool.query(
+          "UPDATE sessions SET status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+          [session.id]
+        );
+      }
+    }
+
+    await logFetch({
+      sessionId: session.id,
+      userId: session.user_id,
+      attemptNumber: manual ? 99 : attemptNumber,
+      status,
+      message: msg
+    });
+
+    return { ok: true, inserted };
+  } catch (err) {
+    await logFetch({
+      sessionId: session.id,
+      userId: session.user_id,
+      attemptNumber: manual ? 99 : attemptNumber,
+      status: "failed",
+      message: err.message
+    });
+    // Leave fetch_status as 'retry' unless it's final
+    if (!manual && attemptNumber >= 3) {
+      await pool.query(
+        "UPDATE sessions SET fetch_status='failed', status='failed', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        [session.id]
+      );
+    } else {
+      await pool.query(
+        "UPDATE sessions SET fetch_status='retry', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        [session.id]
+      );
+    }
+    return { ok: false, error: err.message };
+  }
+}
+
+// ---------- Auth ----------
+app.get("/auth/google", (req, res) => {
+  const oauth2Client = createOAuthClient();
+  const url = oauth2Client.generateAuthUrl({
+    access_type: "offline",
+    prompt: "consent",
+    scope: OAUTH_SCOPES
+  });
+  return res.redirect(url);
+});
+
+app.get("/auth/google/callback", async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send("Missing authorization code");
+
+  const oauth2Client = createOAuthClient();
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    // Fetch basic profile
+    const oauth2 = google.oauth2({ version: "v2", auth: oauth2Client });
+    const { data: profile } = await oauth2.userinfo.get();
+
+    // Persist user + tokens
+    const userId = profile.id; // or keep as string, but then adjust SQL types
+    const email = profile.email;
+    const name = profile.name;
+    const picture = profile.picture;
+
+    const accessToken = tokens.access_token;
+    const refreshToken = tokens.refresh_token; // present on first consent
+    const expiryMs = tokens.expiry_date || (Date.now() + 3600 * 1000);
+
+    // Upsert user
+    await pool.query(
+      `INSERT INTO users ( user_id, email, google_id, access_token, refresh_token, token_expiry, name, picture)
+       VALUES (?, ?, ?, ?, ?, FROM_UNIXTIME(?/1000), ?, ?)
+       ON DUPLICATE KEY UPDATE
+         email = VALUES(email),
+         google_id = VALUES(google_id),
+         access_token = VALUES(access_token),
+         token_expiry = VALUES(token_expiry),
+         name = VALUES(name),
+         picture = VALUES(picture),
+         updated_at = CURRENT_TIMESTAMP`,
+      [userId, email, profile.id, accessToken, refreshToken || "", expiryMs, name || null, picture || null]
+    );
+
+    // Store session state (server-side only)
+    req.session.userId = userId;
+    req.session.email = email;
+
+    res.redirect("/dashboard");
+  } catch (err) {
+    console.error("OAuth error:", err);
+    res.status(500).send("Authentication failed");
+  }
+});
+
+// Soft logout: clear app session only (keeps refresh token for background sync)
+app.post("/auth/logout", (req, res) => {
+  req.session.destroy(() => {});
+  res.json({ message: "Logged out (soft). Background sync still possible." });
+});
+
+// Hard disconnect: revoke refresh token + clear session
+app.post("/auth/disconnect", async (req, res) => {
+  try {
+    const userId = req.session.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const user = await getUserById(userId);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    // Revoke at Google (use refresh token)
+    const revokeResp = await fetch("https://oauth2.googleapis.com/revoke", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token: user.refresh_token })
+    });
+
+    if (!revokeResp.ok) {
+      console.warn("Token revoke failed:", await revokeResp.text());
+    }
+
+    // Clear tokens from DB so we can't sync anymore
+    await pool.query(
+      "UPDATE users SET access_token='', refresh_token='', updated_at=CURRENT_TIMESTAMP WHERE user_id=?",
+      [userId]
+    );
+
+    req.session.destroy(() => {});
+    res.json({ message: "Disconnected from Google and logged out." });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to disconnect" });
+  }
+});
+
+app.get("/dashboard", (req, res) => {
+  if (!req.session.userId) {
+    return res.status(401).send(`<h2>Not authenticated</h2><p><a href="/auth/google">Login with Google</a></p>`);
+  }
+  res.send(`<h1>Welcome!</h1><p>Signed in as ${req.session.email}</p>`);
+});
+
+// ---------- Session APIs ----------
+
+// Create a session (defaults to 20 minutes; for testing pass ?minutes=5)
+app.post("/sessions", async (req, res) => {
+  try {
+    if (!req.session.userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const minutes = Number(req.query.minutes || SESSION_DEFAULT_MINUTES);
+    const now = Date.now();
+    const start = new Date(now);
+    const end = new Date(msAddMinutes(now, minutes));
+
+    const [result] = await pool.query(
+      "INSERT INTO sessions (user_id, start_time, end_time, status, fetch_status) VALUES (?, ?, ?, 'pending', 'not_fetched')",
+      [req.session.userId, start, end]
+    );
+    res.json({
+      sessionId: result.insertId,
+      start_time: start.toISOString(),
+      end_time: end.toISOString(),
+      duration_minutes: minutes
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to create session" });
+  }
+});
+
+// Optionally end a session early
+app.post("/sessions/:id/end", async (req, res) => {
+  try {
+    if (!req.session.userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const { id } = req.params;
+    const now = new Date();
+    const [r] = await pool.query(
+      "UPDATE sessions SET end_time = ?, status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND user_id=?",
+      [now, id, req.session.userId]
+    );
+    if (r.affectedRows === 0) return res.status(404).json({ error: "Session not found" });
+    res.json({ message: "Session ended", end_time: now.toISOString() });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to end session" });
+  }
+});
+
+
+
+// Manual sync-now for a session
+app.post("/sessions/:id/sync-now", async (req, res) => {
+  try {
+    if (!req.session.userId) return res.status(401).json({ error: "Not authenticated" });
+    const { id } = req.params;
+
+    const [[session]] = await pool.query(
+      "SELECT * FROM sessions WHERE id=? AND user_id=?",
+      [id, req.session.userId]
+    );
+    if (!session) return res.status(404).json({ error: "Session not found" });
+
+    const out = await runFetchForSession({ session, attemptNumber: 99, manual: true });
+    res.json({ message: "Manual sync attempted", ...out });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Manual sync failed", details: e.message });
+  }
+});
+
+// Results by session
+app.get("/results/:sessionId", async (req, res) => {
+  try {
+    if (!req.session.userId) return res.status(401).json({ error: "Not authenticated" });
+    const { sessionId } = req.params;
+    const [[row]] = await pool.query(
+      "SELECT * FROM results WHERE session_id = ? AND user_id = ?",
+      [sessionId, req.session.userId]
+    );
+    if (!row) return res.status(404).json({ error: "Result not ready" });
+    res.json(row);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to fetch result" });
+  }
+});
+
+// Optional: list heart rate data sources (debug)
+app.get("/data-sources", async (req, res) => {
+  try {
+    if (!req.session.userId) return res.status(401).json({ error: "Not authenticated" });
+    const user = await getUserById(req.session.userId);
+    const accessToken = await ensureValidAccessToken(user);
+
+    const url = "https://www.googleapis.com/fitness/v1/users/me/dataSources";
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+
+    if (!resp.ok) return res.status(resp.status).send(await resp.text());
+    const data = await resp.json();
+
+    const sources = (data.dataSource || [])
+      .filter(ds => (ds.dataType?.name || "").includes("heart_rate"))
+      .map(ds => ({
+        dataStreamId: ds.dataStreamId,
+        dataTypeName: ds.dataType?.name,
+        application: ds.application?.name || "Unknown",
+        device: ds.device?.model || "Unknown"
+      }));
+
+    res.json({ totalSources: sources.length, sources });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to list data sources" });
+  }
+});
+
+
+
+
+
+
+
+// Create a session via GET for quick browser testing
+app.get("/sessions/create", async (req, res) => {
+  try {
+    if (!req.session.userId) {
+      return res
+        .status(401)
+        .send(`<h2>Not authenticated</h2><p><a href="/auth/google">Login with Google</a></p>`);
+    }
+
+    const minutes = Number(req.query.minutes || SESSION_DEFAULT_MINUTES);
+    const now = Date.now();
+    const start = new Date(now);
+    const end = new Date(msAddMinutes(now, minutes));
+
+    const [result] = await pool.query(
+      "INSERT INTO sessions (user_id, start_time, end_time, status, fetch_status) VALUES (?, ?, ?, 'pending', 'not_fetched')",
+      [req.session.userId, start, end]
+    );
+
+    res.send(`
+      <h2>✅ Session created!</h2>
+      <p>Session ID: ${result.insertId}</p>
+      <p>Start: ${start.toISOString()}</p>
+      <p>End: ${end.toISOString()}</p>
+      <p>Duration: ${minutes} minutes</p>
+      <p><a href="/sessions/${result.insertId}">View session details</a></p>
+    `);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send("❌ Failed to create session");
+  }
+});
+// Get session details by ID
+app.get("/sessions/:id", async (req, res) => {
+  try {
+    if (!req.session.userId) {
+      return res
+        .status(401)
+        .send(`<h2>Not authenticated</h2><p><a href="/auth/google">Login with Google</a></p>`);
+    }
+
+    const sessionId = req.params.id;
+
+    const [rows] = await pool.query(
+      "SELECT * FROM sessions WHERE id = ? AND user_id = ?",
+      [sessionId, req.session.userId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).send("❌ Session not found");
+    }
+
+    const session = rows[0];
+
+    // Check Accept header → if JSON requested, return JSON
+    if (req.headers.accept && req.headers.accept.includes("application/json")) {
+      return res.json(session);
+    }
+
+    // Otherwise render HTML for browser
+    res.send(`
+      <h2>📌 Session Details</h2>
+      <ul>
+        <li><b>ID:</b> ${session.id}</li>
+        <li><b>User ID:</b> ${session.user_id}</li>
+        <li><b>Status:</b> ${session.status}</li>
+        <li><b>Fetch Status:</b> ${session.fetch_status}</li>
+        <li><b>Start:</b> ${new Date(session.start_time).toLocaleString()}</li>
+        <li><b>End:</b> ${new Date(session.end_time).toLocaleString()}</li>
+        <li><b>Created At:</b> ${new Date(session.created_at).toLocaleString()}</li>
+      </ul>
+
+      <p><a href="/sessions/create">➕ Create another session</a></p>
+      <p><a href="/sessions/list">📋 View all sessions</a></p>
+    `);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send("❌ Failed to fetch session details");
+  }
+});
+
+
+
+// ---------- Root ----------
+app.get("/", (req, res) => {
+  res.send("Fit Heart API is running");
+});
+
+
+
+
+
+
+
+app.listen(PORT, () => {
+  console.log(`Server listening on http://localhost:${PORT}`);
+});

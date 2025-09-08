@@ -1,0 +1,494 @@
+import "dotenv/config";
+import cron from "node-cron";
+import pool from "./db/pool.js";
+
+const SESSION_DEFAULT_MINUTES = Number(process.env.SESSION_DEFAULT_MINUTES || 20);
+const FETCH_BUFFER_MINUTES = Number(process.env.FETCH_BUFFER_MINUTES || 15);
+
+function nsRangeFromMs(msStart, msEnd) {
+  const startNs = (BigInt(msStart) * 1000000n).toString();
+  const endNs = (BigInt(msEnd) * 1000000n).toString();
+  return `${startNs}-${endNs}`;
+}
+
+async function getUserById(userId) {
+  const [rows] = await pool.query("SELECT * FROM users WHERE user_id = ?", [userId]);
+  return rows[0] || null;
+}
+
+// Enhanced token management with proper error handling
+async function updateUserTokens(userId, accessToken, expiry, refreshTokenMaybe) {
+  const params = [accessToken, new Date(expiry), userId];
+  let sql = "UPDATE users SET access_token = ?, token_expiry = ? WHERE user_id = ?";
+
+  if (refreshTokenMaybe) {
+    sql = "UPDATE users SET access_token = ?, token_expiry = ?, refresh_token = ? WHERE user_id = ?";
+    params.splice(2, 0, refreshTokenMaybe);
+  }
+  
+  const [result] = await pool.query(sql, params);
+  
+  if (result.affectedRows === 0) {
+    throw new Error(`Failed to update tokens for user ${userId} - user not found`);
+  }
+  
+  console.log(`Updated tokens for user ${userId}, expires: ${new Date(expiry).toISOString()}`);
+}
+
+async function ensureValidAccessTokenWithRetry(user, maxRetries = 3) {
+  const now = Date.now();
+  const expiry = new Date(user.token_expiry).getTime();
+  
+  // Check if token is still valid (with 5-minute buffer)
+  if (now < expiry - 5 * 60 * 1000) {
+    console.log(`Token still valid for user ${user.user_id}, expires: ${new Date(expiry).toISOString()}`);
+    return user.access_token;
+  }
+
+  console.log(`Token expired/expiring for user ${user.user_id}, attempting refresh...`);
+
+  if (!user.refresh_token || user.refresh_token.trim() === '') {
+    throw new Error(`No refresh token available for user ${user.user_id}. User needs to re-authenticate.`);
+  }
+
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`Token refresh attempt ${attempt}/${maxRetries} for user ${user.user_id}`);
+
+      const payload = new URLSearchParams({
+        client_id: "45946153604-kkpr1i9t3pvkinhf624h0d4bhbui7u72.apps.googleusercontent.com",
+        client_secret: "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",
+        refresh_token: user.refresh_token,
+        grant_type: "refresh_token"
+      });
+
+      const resp = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: payload.toString(),
+        timeout: 10000
+      });
+
+      if (!resp.ok) {
+        const errorText = await resp.text();
+        const error = new Error(`Token refresh failed: ${resp.status} ${errorText}`);
+        
+        if (resp.status === 400) {
+          try {
+            const errorData = JSON.parse(errorText);
+            if (errorData.error === 'invalid_grant') {
+              await markUserTokensInvalid(user.user_id);
+              throw new Error(`Refresh token invalid for user ${user.user_id}. User needs to re-authenticate.`);
+            }
+          } catch (parseError) {
+            // Continue with original error if JSON parse fails
+          }
+        }
+        
+        if (resp.status >= 500) {
+          lastError = error;
+          console.warn(`Token refresh attempt ${attempt} failed with server error: ${error.message}`);
+          
+          if (attempt < maxRetries) {
+            const delay = Math.pow(2, attempt - 1) * 1000;
+            console.log(`Waiting ${delay}ms before retry...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+        } else {
+          throw error;
+        }
+      } else {
+        const json = await resp.json();
+        const newAccess = json.access_token;
+        const expiresInMs = (json.expires_in || 3600) * 1000;
+        const newExpiry = Date.now() + expiresInMs;
+
+        await updateUserTokens(user.user_id, newAccess, newExpiry);
+        
+        console.log(`Token refreshed successfully for user ${user.user_id}`);
+        return newAccess;
+      }
+    } catch (error) {
+      lastError = error;
+      console.error(`Token refresh attempt ${attempt} failed:`, error.message);
+      
+      if (attempt < maxRetries && (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT')) {
+        const delay = Math.pow(2, attempt - 1) * 1000;
+        console.log(`Network error, waiting ${delay}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      
+      if (attempt === maxRetries) {
+        break;
+      }
+    }
+  }
+
+  throw new Error(`Token refresh failed after ${maxRetries} attempts. Last error: ${lastError?.message}`);
+}
+
+async function markUserTokensInvalid(userId) {
+  await pool.query(
+    "UPDATE users SET access_token = '', refresh_token = '', token_expiry = NULL, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+    [userId]
+  );
+  console.log(`Marked tokens as invalid for user ${userId} - re-authentication required`);
+}
+
+async function insertHeartRatePoints({ userId, sessionId, startMs, endMs, points }) {
+  if (!points || !points.length) return 0;
+  let inserted = 0;
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    for (const p of points) {
+      const tsMs = Number(p.startTimeNanos) / 1e6;
+      if (Number.isNaN(tsMs)) continue;
+      if (tsMs < startMs || tsMs > endMs) continue;
+
+      const bpm = p.value?.[0]?.fpVal;
+      if (typeof bpm !== "number") continue;
+
+      await conn.query(
+        "INSERT IGNORE INTO heart_rate (user_id, session_id, bpm, timestamp, source) VALUES (?, ?, ?, FROM_UNIXTIME(?/1000), ?)",
+        [userId, sessionId, Math.round(bpm), tsMs, p.originDataSourceId || "google_fit"]
+      );
+      inserted++;
+    }
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+  return inserted;
+}
+
+async function upsertMeanResult(userId, sessionId) {
+  const [[row]] = await pool.query(
+    "SELECT AVG(bpm) AS mean_bpm FROM heart_rate WHERE user_id = ? AND session_id = ?",
+    [userId, sessionId]
+  );
+  const mean = row?.mean_bpm;
+  if (mean == null) return 0;
+
+  await pool.query(
+    `INSERT INTO results (user_id, session_id, mean_bpm)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE mean_bpm = VALUES(mean_bpm), updated_at = CURRENT_TIMESTAMP`,
+    [userId, sessionId, mean]
+  );
+  return Number(mean);
+}
+
+async function logFetch({ sessionId, userId, attemptNumber, status, message }) {
+  await pool.query(
+    "INSERT INTO fetch_logs (session_id, user_id, attempt_number, status, message) VALUES (?, ?, ?, ?, ?)",
+    [sessionId, userId, attemptNumber, status, message?.slice(0, 5000) || null]
+  );
+}
+
+async function fetchGoogleFitDataset({ accessToken, dataSourceId, startMs, endMs }) {
+  const datasetId = nsRangeFromMs(startMs, endMs);
+  const url = `https://www.googleapis.com/fitness/v1/users/me/dataSources/${encodeURIComponent(
+    dataSourceId
+  )}/datasets/${datasetId}`;
+
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Dataset API ${resp.status}: ${text}`);
+  }
+
+  const json = await resp.json();
+  return json.point || [];
+}
+
+// Updated retry schedule: 15min, 30min, 1h, 6h, 12h
+function attemptThresholdMinutes(attemptNumber) {
+  switch (attemptNumber) {
+    case 1: return 15;     // 15 minutes after session end
+    case 2: return 30;     // 30 minutes after session end
+    case 3: return 60;     // 1 hour after session end
+    case 4: return 360;    // 6 hours after session end
+    case 5: return 720;    // 12 hours after session end
+    default: return 720;   // fallback
+  }
+}
+
+async function countAttempts(sessionId) {
+  const [[row]] = await pool.query(
+    "SELECT COUNT(*) AS c FROM fetch_logs WHERE session_id = ? AND attempt_number IN (1,2,3,4,5)",
+    [sessionId]
+  );
+  return Number(row.c || 0);
+}
+
+function toISODate(timestamp) {
+  return new Date(timestamp).toISOString();
+}
+
+async function runFetchForSessionWithTokenHandling({ session, attemptNumber, manual = false }) {
+  let user;
+  let accessToken;
+  
+  try {
+    user = await getUserById(session.user_id);
+    if (!user) {
+      throw new Error("User not found for session");
+    }
+
+    // Always check token validity before making API calls
+    accessToken = await ensureValidAccessTokenWithRetry(user);
+    
+  } catch (tokenError) {
+    console.error(`Token error for session ${session.id}:`, tokenError.message);
+    
+    await logFetch({
+      sessionId: session.id,
+      userId: session.user_id,
+      attemptNumber: manual ? 99 : attemptNumber,
+      status: "failed",
+      message: `Token Error: ${tokenError.message}`
+    });
+
+    if (tokenError.message.includes('needs to re-authenticate')) {
+      await pool.query(
+        "UPDATE sessions SET fetch_status = 'failed', status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [session.id]
+      );
+      return { ok: false, error: "User needs to re-authenticate", requiresReauth: true };
+    }
+
+    const isFinal = !manual && attemptNumber >= 5;
+    if (isFinal) {
+      await pool.query(
+        "UPDATE sessions SET fetch_status = 'failed', status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [session.id]
+      );
+    } else {
+      await pool.query(
+        "UPDATE sessions SET fetch_status = 'retry', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [session.id]
+      );
+    }
+
+    return { ok: false, error: tokenError.message };
+  }
+
+  const bufferMs = FETCH_BUFFER_MINUTES * 60 * 1000;
+  const startMs = new Date(session.start_time).getTime();
+  const endMs = new Date(session.end_time).getTime();
+  const adjustedStart = startMs - bufferMs;
+  const adjustedEnd = endMs + bufferMs;
+
+  const dataSourceId = "derived:com.google.heart_rate.bpm:com.google.android.gms:merge_heart_rate_bpm";
+
+  try {
+    const points = await fetchGoogleFitDataset({
+      accessToken,
+      dataSourceId,
+      startMs: adjustedStart,
+      endMs: adjustedEnd
+    });
+
+    const inserted = await insertHeartRatePoints({
+      userId: session.user_id,
+      sessionId: session.id,
+      startMs,
+      endMs,
+      points
+    });
+
+    let status = "no_data";
+    let msg = `Inserted ${inserted} points`;
+
+    if (inserted > 0) {
+      const mean = await upsertMeanResult(session.user_id, session.id);
+      await pool.query(
+        "UPDATE sessions SET fetch_status = 'fetched', status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [session.id]
+      );
+      status = "success";
+      msg += `; mean_bpm=${mean}`;
+    } else {
+      const isFinal = !manual && attemptNumber >= 5;
+      await pool.query(
+        "UPDATE sessions SET fetch_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [isFinal ? "failed" : "retry", session.id]
+      );
+      if (isFinal) {
+        await pool.query(
+          "UPDATE sessions SET status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+          [session.id]
+        );
+      }
+    }
+
+    await logFetch({
+      sessionId: session.id,
+      userId: session.user_id,
+      attemptNumber: manual ? 99 : attemptNumber,
+      status,
+      message: msg
+    });
+
+    return { ok: true, inserted };
+    
+  } catch (err) {
+    console.error(`Google Fit API error for session ${session.id}:`, err.message);
+    
+    await logFetch({
+      sessionId: session.id,
+      userId: session.user_id,
+      attemptNumber: manual ? 99 : attemptNumber,
+      status: "failed",
+      message: `API Error: ${err.message}`
+    });
+
+    if (err.message.includes('401') || err.message.includes('403')) {
+      console.warn(`API returned auth error despite token refresh - will retry`);
+    }
+
+    const isFinal = !manual && attemptNumber >= 5;
+    if (isFinal) {
+      await pool.query(
+        "UPDATE sessions SET fetch_status='failed', status='failed', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        [session.id]
+      );
+    } else {
+      await pool.query(
+        "UPDATE sessions SET fetch_status='retry', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        [session.id]
+      );
+    }
+    
+    return { ok: false, error: err.message };
+  }
+}
+
+// Cron job - every 5 minutes for testing
+cron.schedule("*/5 * * * *", async () => {
+  try {
+    console.log(`CRON: Starting sync check at ${new Date().toISOString()}`);
+    
+    const [sessions] = await pool.query(
+      `SELECT * FROM sessions 
+       WHERE fetch_status IN ('not_fetched','retry') 
+       AND end_time IS NOT NULL 
+       AND end_time <= NOW()
+       ORDER BY end_time ASC`
+    );
+    
+    console.log(`Found ${sessions.length} sessions to check for sync`);
+
+    for (const session of sessions) {
+      try {
+        const endMs = new Date(session.end_time).getTime();
+        const attemptsSoFar = await countAttempts(session.id);
+        const nextAttempt = attemptsSoFar + 1;
+
+        if (nextAttempt > 5) {
+          console.log(`Session ${session.id} already exhausted all attempts`);
+          continue;
+        }
+
+        const thresholdMinutes = attemptThresholdMinutes(nextAttempt);
+        const dueAt = endMs + thresholdMinutes * 60 * 1000;
+
+        if (Date.now() >= dueAt) {
+          console.log(
+            `CRON: Processing session ${session.id} (attempt ${nextAttempt}) - ended ${toISODate(endMs)}, threshold ${thresholdMinutes}min`
+          );
+          
+          const result = await runFetchForSessionWithTokenHandling({ 
+            session, 
+            attemptNumber: nextAttempt 
+          });
+          
+          console.log(`Session ${session.id} sync result:`, result);
+        } else {
+          const minutesUntilDue = Math.round((dueAt - Date.now()) / (1000 * 60));
+          console.log(`Session ${session.id} not due yet (${minutesUntilDue} minutes remaining for attempt ${nextAttempt})`);
+        }
+      } catch (sessionError) {
+        console.error(`Error processing session ${session.id}:`, sessionError);
+        
+        await pool.query(
+          "INSERT INTO fetch_logs (session_id, user_id, attempt_number, status, message) VALUES (?, ?, ?, ?, ?)",
+          [session.id, session.user_id, 999, "failed", `CRON Error: ${sessionError.message}`]
+        );
+      }
+    }
+    
+    console.log(`CRON: Completed sync check at ${new Date().toISOString()}`);
+  } catch (error) {
+    console.error("CRON: Fatal error during sync check:", error);
+  }
+});
+
+// Startup sync check
+setTimeout(async () => {
+  console.log("Running startup sync check...");
+  try {
+    const [sessions] = await pool.query(
+      `SELECT * FROM sessions 
+       WHERE fetch_status IN ('not_fetched','retry') 
+       AND end_time IS NOT NULL 
+       AND end_time <= NOW()
+       ORDER BY end_time ASC`
+    );
+    
+    console.log(`Startup: Found ${sessions.length} sessions to check for sync`);
+
+    for (const session of sessions) {
+      try {
+        const endMs = new Date(session.end_time).getTime();
+        const attemptsSoFar = await countAttempts(session.id);
+        const nextAttempt = attemptsSoFar + 1;
+
+        if (nextAttempt > 5) {
+          console.log(`Startup: Session ${session.id} already exhausted all attempts`);
+          continue;
+        }
+
+        const thresholdMinutes = attemptThresholdMinutes(nextAttempt);
+        const dueAt = endMs + thresholdMinutes * 60 * 1000;
+
+        if (Date.now() >= dueAt) {
+          console.log(
+            `STARTUP: Processing session ${session.id} (attempt ${nextAttempt}) - ended ${toISODate(endMs)}, threshold ${thresholdMinutes}min`
+          );
+          
+          const result = await runFetchForSessionWithTokenHandling({ 
+            session, 
+            attemptNumber: nextAttempt 
+          });
+          
+          console.log(`Startup sync result for session ${session.id}:`, result);
+        } else {
+          const minutesUntilDue = Math.round((dueAt - Date.now()) / (1000 * 60));
+          console.log(`Startup: Session ${session.id} not due yet (${minutesUntilDue} minutes remaining for attempt ${nextAttempt})`);
+        }
+      } catch (sessionError) {
+        console.error(`Startup error processing session ${session.id}:`, sessionError);
+      }
+    }
+    
+    console.log("Startup sync check completed");
+  } catch (error) {
+    console.error("Startup sync check failed:", error);
+  }
+}, 5000);
+
+console.log("Cron worker started - will check for syncs every 5 minutes...");
